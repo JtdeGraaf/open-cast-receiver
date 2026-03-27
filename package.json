@@ -1,0 +1,24 @@
+{
+  "name": "open-cast-receiver",
+  "version": "1.0.0",
+  "description": "Open-source Chromecast receiver with broad codec support (HEVC, HLS, DASH)",
+  "author": "Open Cast Receiver Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JtdeGraaf/open-cast-receiver.git"
+  },
+  "scripts": {
+    "start": "npx serve . -l 8080"
+  },
+  "keywords": [
+    "chromecast",
+    "cast",
+    "receiver",
+    "hevc",
+    "h265",
+    "hls",
+    "dash",
+    "open-source"
+  ]
+}
