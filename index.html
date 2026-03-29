@@ -217,6 +217,66 @@
       const context = cast.framework.CastReceiverContext.getInstance();
       const playerManager = context.getPlayerManager();
 
+      // Intercept PLAY command for Shaka playback
+      playerManager.setMessageInterceptor(
+        cast.framework.messages.MessageType.PLAY,
+        (requestData) => {
+          if (usingShakaForPlayback) {
+            video.play().catch(e => console.warn(LOG_PREFIX, 'Play error:', e));
+          }
+          return requestData;
+        }
+      );
+
+      // Intercept PAUSE command for Shaka playback
+      playerManager.setMessageInterceptor(
+        cast.framework.messages.MessageType.PAUSE,
+        (requestData) => {
+          if (usingShakaForPlayback) {
+            video.pause();
+          }
+          return requestData;
+        }
+      );
+
+      // Intercept SEEK command for Shaka playback
+      playerManager.setMessageInterceptor(
+        cast.framework.messages.MessageType.SEEK,
+        (requestData) => {
+          if (usingShakaForPlayback && requestData.currentTime !== undefined) {
+            video.currentTime = requestData.currentTime;
+          }
+          return requestData;
+        }
+      );
+
+      // Intercept STOP command for Shaka playback
+      playerManager.setMessageInterceptor(
+        cast.framework.messages.MessageType.STOP,
+        async (requestData) => {
+          if (usingShakaForPlayback) {
+            video.pause();
+            await shakaPlayer.unload();
+            usingShakaForPlayback = false;
+            showSplash();
+          }
+          return requestData;
+        }
+      );
+
+      // Provide current playback position for Shaka playback
+      playerManager.setMediaPlaybackInfoHandler((loadRequestData, playbackConfig) => {
+        if (usingShakaForPlayback) {
+          // Return current video position and duration
+          return {
+            ...playbackConfig,
+            currentTime: video.currentTime,
+            duration: video.duration || 0,
+          };
+        }
+        return playbackConfig;
+      });
+
       // Handle LOAD requests
       playerManager.setMessageInterceptor(
         cast.framework.messages.MessageType.LOAD,
@@ -266,16 +326,8 @@
                 hideSplash();
                 usingShakaForPlayback = true;
 
-                // Sync media information with Cast framework
-                const mediaStatus = playerManager.getMediaInformation() || {};
-                mediaStatus.contentId = url;
-                mediaStatus.contentUrl = url;
-                mediaStatus.duration = video.duration || 0;
-                playerManager.setMediaInformation(mediaStatus);
-
-                // Start playback
+                // Start playback first
                 if (loadRequestData.autoplay !== false) {
-                  // Handle autoplay rejection
                   try {
                     await video.play();
                   } catch (playError) {
@@ -283,19 +335,37 @@
                   }
                 }
 
-                // Wait for metadata before seeking
-                if (loadRequestData.currentTime) {
+                // Handle seeking to start position (check multiple possible locations)
+                const startTime = loadRequestData.currentTime || loadRequestData.startTime || loadRequestData.media?.startAbsoluteTime || 0;
+                if (startTime > 0) {
                   if (video.readyState >= 1) {
-                    video.currentTime = loadRequestData.currentTime;
+                    video.currentTime = startTime;
                   } else {
                     video.addEventListener('loadedmetadata', function seekOnce() {
-                      video.currentTime = loadRequestData.currentTime;
+                      video.currentTime = startTime;
                       video.removeEventListener('loadedmetadata', seekOnce);
                     });
                   }
                 }
 
-                // Return null to prevent default player from loading
+                // Set up media information for Cast framework to track state
+                const castMediaInfo = new cast.framework.messages.MediaInformation();
+                castMediaInfo.contentId = url;
+                castMediaInfo.contentUrl = url;
+                castMediaInfo.contentType = contentType;
+                castMediaInfo.streamType = mediaInfo.streamType || cast.framework.messages.StreamType.BUFFERED;
+                castMediaInfo.metadata = mediaInfo.metadata;
+
+                // Set media info so sender can track what's playing
+                playerManager.setMediaInformation(castMediaInfo);
+
+                // Set player state to PLAYING to notify sender
+                playerManager.setPlayerState(cast.framework.messages.PlayerState.PLAYING);
+
+                // Broadcast status to sender immediately
+                playerManager.broadcastStatus(true);
+
+                // Return null - we've handled playback, don't let default player interfere
                 return null;
               } catch (error) {
                 console.error(LOG_PREFIX, 'Shaka load error:', error);
@@ -345,6 +415,7 @@
       video.addEventListener('play', () => {
         console.log(LOG_PREFIX, 'Video playing');
         if (usingShakaForPlayback) {
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.PLAYING);
           playerManager.broadcastStatus(true);
         }
       });
@@ -352,6 +423,23 @@
       video.addEventListener('pause', () => {
         console.log(LOG_PREFIX, 'Video paused');
         if (usingShakaForPlayback) {
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.PAUSED);
+          playerManager.broadcastStatus(true);
+        }
+      });
+
+      video.addEventListener('waiting', () => {
+        console.log(LOG_PREFIX, 'Video buffering');
+        if (usingShakaForPlayback) {
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.BUFFERING);
+          playerManager.broadcastStatus(true);
+        }
+      });
+
+      video.addEventListener('playing', () => {
+        console.log(LOG_PREFIX, 'Video resumed playing');
+        if (usingShakaForPlayback) {
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.PLAYING);
           playerManager.broadcastStatus(true);
         }
       });
@@ -369,6 +457,7 @@
           if (mediaInfo) {
             mediaInfo.duration = video.duration;
             playerManager.setMediaInformation(mediaInfo);
+            playerManager.broadcastStatus(true);
           }
         }
       });
@@ -376,9 +465,20 @@
       video.addEventListener('ended', () => {
         console.log(LOG_PREFIX, 'Video ended');
         if (usingShakaForPlayback) {
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.IDLE);
           playerManager.broadcastStatus(true);
+          usingShakaForPlayback = false;
         }
         showSplash();
+      });
+
+      video.addEventListener('error', (e) => {
+        console.error(LOG_PREFIX, 'Video error:', e);
+        if (usingShakaForPlayback) {
+          showError('Video playback error');
+          playerManager.setPlayerState(cast.framework.messages.PlayerState.IDLE);
+          playerManager.broadcastStatus(true);
+        }
       });
 
       // Initialize
