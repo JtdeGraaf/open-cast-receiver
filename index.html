@@ -138,6 +138,8 @@
       const errorDiv = document.getElementById('error');
 
       let shakaPlayer = null;
+      let errorTimeout = null;
+      let usingShakaForPlayback = false;
 
       // Initialize Shaka Player
       function initShaka() {
@@ -185,9 +187,22 @@
       function showError(message) {
         errorDiv.textContent = message;
         errorDiv.style.display = 'block';
-        setTimeout(() => {
+        // Clear any existing timeout
+        if (errorTimeout) {
+          clearTimeout(errorTimeout);
+        }
+        // Keep error visible for 15 seconds
+        errorTimeout = setTimeout(() => {
           errorDiv.style.display = 'none';
-        }, 5000);
+        }, 15000);
+      }
+
+      function hideError() {
+        if (errorTimeout) {
+          clearTimeout(errorTimeout);
+          errorTimeout = null;
+        }
+        errorDiv.style.display = 'none';
       }
 
       function hideSplash() {
@@ -206,53 +221,99 @@
       playerManager.setMessageInterceptor(
         cast.framework.messages.MessageType.LOAD,
         async (loadRequestData) => {
-          console.log(LOG_PREFIX, 'Load request:', loadRequestData);
+          try {
+            console.log(LOG_PREFIX, 'Load request:', loadRequestData);
 
-          const mediaInfo = loadRequestData.media;
-          const url = mediaInfo.contentUrl || mediaInfo.contentId;
-          const contentType = mediaInfo.contentType || '';
+            // Clear any previous errors on new load
+            hideError();
 
-          console.log(LOG_PREFIX, 'Loading URL:', url);
-          console.log(LOG_PREFIX, 'Content type:', contentType);
-
-          // For HLS/DASH streams, use Shaka Player
-          const isAdaptiveStream =
-            url.includes('.m3u8') ||
-            url.includes('.mpd') ||
-            contentType.includes('mpegURL') ||
-            contentType.includes('dash');
-
-          if (isAdaptiveStream || contentType.includes('matroska') || url.includes('.mkv')) {
-            try {
-              hideSplash();
-
-              // Use Shaka for adaptive streams
-              await shakaPlayer.load(url);
-              console.log(LOG_PREFIX, 'Shaka loaded successfully');
-
-              // Start playback
-              if (loadRequestData.autoplay !== false) {
-                video.play();
-              }
-
-              // Seek to start position if specified
-              if (loadRequestData.currentTime) {
-                video.currentTime = loadRequestData.currentTime;
-              }
-
-              // Return null to prevent default player from loading
-              return null;
-            } catch (error) {
-              console.error(LOG_PREFIX, 'Shaka load error:', error);
-              // Fall back to default player
-              hideSplash();
+            const mediaInfo = loadRequestData.media;
+            if (!mediaInfo) {
+              console.error(LOG_PREFIX, 'No media info in load request');
+              showError('No media info in load request');
               return loadRequestData;
             }
-          }
 
-          // For standard formats, use default Cast player
-          hideSplash();
-          return loadRequestData;
+            const url = mediaInfo.contentUrl || mediaInfo.contentId;
+            if (!url) {
+              console.error(LOG_PREFIX, 'No URL in load request');
+              showError('No URL in load request');
+              return loadRequestData;
+            }
+
+            const contentType = mediaInfo.contentType || '';
+
+            console.log(LOG_PREFIX, 'Loading URL:', url);
+            console.log(LOG_PREFIX, 'Content type:', contentType);
+
+            // For HLS/DASH streams, use Shaka Player (case-insensitive detection)
+            const urlLower = url.toLowerCase();
+            const isAdaptiveStream =
+              urlLower.includes('.m3u8') ||
+              urlLower.includes('.mpd') ||
+              contentType.toLowerCase().includes('mpegurl') ||
+              contentType.toLowerCase().includes('dash');
+
+            if (isAdaptiveStream || contentType.includes('matroska') || urlLower.includes('.mkv')) {
+              try {
+                // Unload previous stream before loading new content
+                await shakaPlayer.unload();
+
+                // Use Shaka for adaptive streams
+                await shakaPlayer.load(url);
+                console.log(LOG_PREFIX, 'Shaka loaded successfully');
+
+                hideSplash();
+                usingShakaForPlayback = true;
+
+                // Sync media information with Cast framework
+                const mediaStatus = playerManager.getMediaInformation() || {};
+                mediaStatus.contentId = url;
+                mediaStatus.contentUrl = url;
+                mediaStatus.duration = video.duration || 0;
+                playerManager.setMediaInformation(mediaStatus);
+
+                // Start playback
+                if (loadRequestData.autoplay !== false) {
+                  // Handle autoplay rejection
+                  try {
+                    await video.play();
+                  } catch (playError) {
+                    console.warn(LOG_PREFIX, 'Autoplay blocked:', playError);
+                  }
+                }
+
+                // Wait for metadata before seeking
+                if (loadRequestData.currentTime) {
+                  if (video.readyState >= 1) {
+                    video.currentTime = loadRequestData.currentTime;
+                  } else {
+                    video.addEventListener('loadedmetadata', function seekOnce() {
+                      video.currentTime = loadRequestData.currentTime;
+                      video.removeEventListener('loadedmetadata', seekOnce);
+                    });
+                  }
+                }
+
+                // Return null to prevent default player from loading
+                return null;
+              } catch (error) {
+                console.error(LOG_PREFIX, 'Shaka load error:', error);
+                showError('Stream load failed: ' + error.message);
+                // Fall back to default player
+                return loadRequestData;
+              }
+            }
+
+            // For standard formats, use default Cast player
+            usingShakaForPlayback = false;
+            hideSplash();
+            return loadRequestData;
+          } catch (error) {
+            console.error(LOG_PREFIX, 'Load interceptor error:', error);
+            showError('Load error: ' + error.message);
+            return loadRequestData;
+          }
         }
       );
 
@@ -280,17 +341,43 @@
         }
       );
 
-      // Sync Shaka player state with Cast
+      // Sync Shaka player state with Cast framework
       video.addEventListener('play', () => {
         console.log(LOG_PREFIX, 'Video playing');
+        if (usingShakaForPlayback) {
+          playerManager.broadcastStatus(true);
+        }
       });
 
       video.addEventListener('pause', () => {
         console.log(LOG_PREFIX, 'Video paused');
+        if (usingShakaForPlayback) {
+          playerManager.broadcastStatus(true);
+        }
+      });
+
+      video.addEventListener('timeupdate', () => {
+        if (usingShakaForPlayback) {
+          // Periodically sync playback position (throttled by browser)
+          playerManager.broadcastStatus(false);
+        }
+      });
+
+      video.addEventListener('durationchange', () => {
+        if (usingShakaForPlayback && video.duration) {
+          const mediaInfo = playerManager.getMediaInformation();
+          if (mediaInfo) {
+            mediaInfo.duration = video.duration;
+            playerManager.setMediaInformation(mediaInfo);
+          }
+        }
       });
 
       video.addEventListener('ended', () => {
         console.log(LOG_PREFIX, 'Video ended');
+        if (usingShakaForPlayback) {
+          playerManager.broadcastStatus(true);
+        }
         showSplash();
       });
 
