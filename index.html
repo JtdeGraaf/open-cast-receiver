@@ -154,7 +154,21 @@
 
         shakaPlayer.addEventListener('error', (event) => {
           console.error(LOG_PREFIX, 'Shaka error:', event.detail);
-          showError('Playback error: ' + event.detail.message);
+          const errorCode = event.detail.code;
+          let errorMessage = 'Playback error: ' + event.detail.message;
+
+          // Provide more helpful error messages
+          if (errorCode === 3016) {
+            errorMessage = 'Cannot load media: Network/CORS error';
+          } else if (errorCode >= 3000 && errorCode < 4000) {
+            errorMessage = 'Network error loading media';
+          } else if (errorCode >= 4000 && errorCode < 5000) {
+            errorMessage = 'Manifest parsing error';
+          } else if (errorCode >= 6000 && errorCode < 7000) {
+            errorMessage = 'Unsupported video codec (try different source)';
+          }
+
+          showError(errorMessage);
         });
 
         // Configure for broad codec support
@@ -177,7 +191,23 @@
               backoffFactor: 2,
               timeout: 30000
             }
+          },
+          // Enable more codecs
+          mediaSource: {
+            forceTransmux: false,
           }
+        });
+
+        // Log track information when loaded
+        shakaPlayer.addEventListener('loaded', () => {
+          const tracks = shakaPlayer.getVariantTracks();
+          console.log(LOG_PREFIX, 'Available tracks:', tracks.map(t => ({
+            id: t.id,
+            videoCodec: t.videoCodec,
+            audioCodec: t.audioCodec,
+            width: t.width,
+            height: t.height
+          })));
         });
 
         console.log(LOG_PREFIX, 'Shaka Player initialized');
@@ -306,15 +336,22 @@
             console.log(LOG_PREFIX, 'Loading URL:', url);
             console.log(LOG_PREFIX, 'Content type:', contentType);
 
-            // For HLS/DASH streams, use Shaka Player (case-insensitive detection)
+            // Determine if we need Shaka Player for this content
             const urlLower = url.toLowerCase();
-            const isAdaptiveStream =
-              urlLower.includes('.m3u8') ||
-              urlLower.includes('.mpd') ||
-              contentType.toLowerCase().includes('mpegurl') ||
-              contentType.toLowerCase().includes('dash');
+            const pathOnly = urlLower.split('?')[0];
+            const contentTypeLower = contentType.toLowerCase();
 
-            if (isAdaptiveStream || contentType.includes('matroska') || urlLower.includes('.mkv')) {
+            // Use Shaka for: HLS (.m3u8), DASH (.mpd), MKV (matroska)
+            // Don't use Shaka for: MP4, WebM (Cast default player handles these well)
+            const isHLS = pathOnly.endsWith('.m3u8') || pathOnly.includes('.m3u8/') || contentTypeLower.includes('mpegurl');
+            const isDASH = pathOnly.endsWith('.mpd') || contentTypeLower.includes('dash');
+            const isMKV = pathOnly.endsWith('.mkv') || contentTypeLower.includes('matroska');
+
+            const needsShaka = isHLS || isDASH || isMKV;
+
+            console.log(LOG_PREFIX, 'Stream detection:', { isHLS, isDASH, isMKV, needsShaka, pathOnly, contentType });
+
+            if (needsShaka) {
               try {
                 // Unload previous stream before loading new content
                 await shakaPlayer.unload();
@@ -322,6 +359,20 @@
                 // Use Shaka for adaptive streams
                 await shakaPlayer.load(url);
                 console.log(LOG_PREFIX, 'Shaka loaded successfully');
+
+                // Log track information to help debug codec issues
+                const tracks = shakaPlayer.getVariantTracks();
+                console.log(LOG_PREFIX, 'Variant tracks:', tracks.length);
+                tracks.forEach((t, i) => {
+                  console.log(LOG_PREFIX, `Track ${i}: video=${t.videoCodec || 'none'}, audio=${t.audioCodec || 'none'}, ${t.width}x${t.height}`);
+                });
+
+                // Warn if no video tracks (audio only)
+                const hasVideo = tracks.some(t => t.videoCodec);
+                if (!hasVideo && tracks.length > 0) {
+                  console.warn(LOG_PREFIX, 'No video tracks available - video codec may be unsupported');
+                  showError('Video codec not supported by this device');
+                }
 
                 hideSplash();
                 usingShakaForPlayback = true;
